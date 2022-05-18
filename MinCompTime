@@ -1,0 +1,115 @@
+using JuMP
+using Pkg
+using TimerOutputs
+using Statistics
+using DataFramesMeta
+import DataFrames
+import CSV
+import Gurobi
+import Test
+
+function get_input_data( instance )
+    # reads in the data from csv files and returns a tuple of the extracted quanitites.
+    DATA_DIR = "/Users/Abe/Documents/!Cornell Tech/ORIE5135 Int Program/Project/data/q5/dataset_1/instance_$(instance).csv"
+    CONSTANTS_DIR = "/Users/Abe/Documents/!Cornell Tech/ORIE5135 Int Program/Project/data/q5/dataset_1/constants.csv"
+    job_attributes = CSV.read(DATA_DIR, DataFrames.DataFrame) #contains p_i and r_i
+    constants = CSV.read(CONSTANTS_DIR, DataFrames.DataFrame) #contains P, R, and n
+    p_i = job_attributes.p_i #time 
+    r_i = job_attributes.r_i #memory
+    (R, n) = constants.value
+    return (p_i, r_i, R, n)
+end
+
+function min_completion_time(instance; verbose = true) 
+    data = get_input_data(instance) #retrieve data from csv files
+    processTime = data[1] #job time requirement
+    memoryReq = data[2] # job memory requirement
+    m = length(memoryReq) # number of jobs
+    R = data[3] # machine memory limit
+    n = data[4] # number of machines
+    
+    model = Model(Gurobi.Optimizer)
+    @variable(model, t >= 0) #variable that contains the maximum completion time out of all machines
+    @variable(model, x[1:m, 1:n], Bin) # x(i, j) = 1 if job i is done by machine j
+
+    # Objective: minimize completion time t of the last machine to finish
+    @objective(model, Min, t)
+
+    # Constraint: The longest machine work time is t
+    @constraint(model, long_compl_time[j in 1:n], sum( processTime[i] * x[i, j] for i in 1:m) <= t )
+    # Constraint: Memory limit
+    @constraint(model, memory[j in 1:n], sum( memoryReq[i] * x[i, j] for i in 1:m) <= R )
+    # Constraint: Job completion
+    @constraint(model, job_completion[i in 1:m], sum(x[i, j] for j in 1:n) == 1)
+
+    # Find objective value of the continuous relaxation
+    undo_relax = relax_integrality(model)
+    optimize!(model)
+    LP_obj = objective_value(model)
+
+    # reimpose integrality reqs and solve
+    undo_relax()
+    optimize!(model)
+    IP_obj = objective_value(model)
+
+    # Solve problem using Gurobi
+    optimize!(model)
+    if verbose
+        println("Objective is: ", objective_value(model))
+        println("Solution is:")
+        for j in 1:n
+            assigned = Int64[]
+            for i in 1:m
+                if value(x[i, j]) == 1
+                    append!(assigned, i)
+                end
+            end
+            println("Machine $(j): ", assigned)
+        end
+    end
+    time = solve_time(model) # time to solve
+    nodes = node_count(model) # number of branch and bound nodes explored
+    return (LP_obj, IP_obj, nodes, time)
+    
+end
+
+function collect_data()
+    df = DataFrame( Dataset = Int64[], Instance = Int64[], LP_Objective = Float64[], IP_Objective = Float64[], Node_Count = Int64[], Time = Float64[])
+    for i in 0:9
+        (LP, IP, n, t) = min_completion_time(i)
+        push!(df, [1, i, LP, IP, n, t])
+    end
+    df.Solution_Gap = (df.IP_Objective .- df.LP_Objective)./df.IP_Objective
+    CSV.write("/Users/Abe/Documents/!Cornell Tech/ORIE5135 Int Program/Project/data/q5/solutions.csv", df)
+
+    return df
+end
+
+function analyze_data(df)
+    new_df = DataFrame( Dataset = Int64[], Solution_Gap = Float64[], Node_Count = Float64[], Time = Float64[], T_sub_300 = Int64[])
+    d = 1
+    sg = mean(df.Solution_Gap)
+    nc = mean(df.Node_Count)
+    time = mean(df.Time)
+    sub_300 = 0
+    for t in df.Time
+        if t <= 300
+            sub_300 += 1
+        end
+    end
+    push!(new_df, [d, sg, nc, time, sub_300])
+    CSV.write("/Users/Abe/Documents/!Cornell Tech/ORIE5135 Int Program/Project/data/q5/solution_data.csv", new_df)
+
+
+    return new_df
+end
+df = collect_data()
+tab = analyze_data(df)
+
+
+
+# table = analyzeData(df)
+# println(table)
+
+# minCompletionTime(2)
+

@@ -1,0 +1,284 @@
+using JuMP
+using Pkg
+using TimerOutputs
+using Statistics
+using DataFramesMeta
+import DataFrames
+import CSV
+import Gurobi
+import Test
+
+function get_input_data( question, dataset, instance )
+    # reads in the data from csv files and returns a tuple of the extracted quanitites.
+    ds_str = ""
+    if dataset == 4
+        ds_str = "bonus"
+        instance = 0
+    else
+        ds_str = "dataset_$(dataset)"
+    end
+
+    DATA_DIR = "/Users/Abe/Documents/!Cornell Tech/ORIE5135 Int Program/Project/data/q$(question)/$(ds_str)/instance_$(instance).csv"
+    CONSTANTS_DIR = "/Users/Abe/Documents/!Cornell Tech/ORIE5135 Int Program/Project/data/q$(question)/$(ds_str)/constants.csv"
+    job_attributes = CSV.read(DATA_DIR, DataFrames.DataFrame) #contains p_i and r_i
+    constants = CSV.read(CONSTANTS_DIR, DataFrames.DataFrame) #contains P, R, and n
+    p_i = job_attributes.p_i #time 
+    r_i = job_attributes.r_i #memory
+    if question == 5
+        (R, n) = constants.value
+        return (p_i, r_i, R, n)
+    else
+        (P, R, n) = constants.value
+        return (p_i, r_i, P, R, n)
+    end
+end
+
+# part 1
+function natural_formulation(dataset, instance, time_limit; verbose = true) 
+    data = get_input_data(3, dataset, instance) #retrieve data from csv files
+    processTime = data[1] #job time requirement
+    memoryReq = data[2] # job memory requirement
+    m = length(memoryReq) # number of jobs
+    P = data[3] #machine time limit
+    R = data[4] # machine memory limit
+    n = data[5] # number of machines
+
+    model = Model(Gurobi.Optimizer)
+    set_time_limit_sec(model, time_limit)
+    set_silent(model)
+
+    @variable(model, y[1:n], Bin) # y(j) = 1 if machine j is "turned on"
+    @variable(model, x[1:m, 1:n], Bin) # x(i, j) = 1 if job i is done by machine j
+    # Objective: minimize # machines used
+    @objective(model, Min, sum(y) )
+    # Constraint: machine must be "on" in order to do work
+    @constraint(model, use_machine[i in 1:m, j in 1:n], x[i, j] <= y[j] )
+    # Constraint: Memory limit
+    @constraint(model, memory[j in 1:n], sum( memoryReq[i] * x[i, j] for i in 1:m) <= R*y[j] )
+    # Constraint: Time Requirement
+    @constraint(model, time[j in 1:n], sum( processTime[i] * x[i, j] for i in 1:m) <= P*y[j] )
+    # Constraint: Job completion
+    @constraint(model, job_completion[i in 1:m], sum(x[i, j] for j in 1:n) == 1)
+    
+    # Find objective value of the continuous relaxation
+    undo_relax = relax_integrality(model)
+    optimize!(model)
+    LP_obj = objective_value(model)
+
+    if verbose
+        println("Solution is:")
+        for i in 1:n
+            print("y[$i] = ", value(y[i]), "\n")
+        end
+    end
+
+    # reimpose integrality reqs and solve
+    undo_relax()
+    optimize!(model)
+    IP_obj = objective_value(model)
+
+    
+
+    time = solve_time(model) # time to solve
+    nodes = node_count(model) # number of branch and bound nodes explored
+    return (LP_obj, IP_obj, nodes, time)
+end
+
+# part 2
+function get_feasible_assignments(dataset, instance) 
+    #returns a list of every combination of job indices that could be feasibly assigned to a machine
+    # modified from a powerset function found here:
+    # https://discourse.julialang.org/t/generate-all-subsets-of-a-set/12810/5
+    data = get_input_data(3, dataset, instance) #retrieve data from csv files
+    p = data[1] #time requirement
+    r = data[2] #memory requirement
+    m = length(p) # number of jobs
+    P = data[3] #time limit
+    R = data[4] #memory limit
+
+    x = [i for i in 1:m] # list of job indices
+    result = [ Int[] ]
+    for elem in x, j in eachindex(result)
+        combo = [result[j] ; elem]
+        p_sum = 0
+        r_sum = 0
+        for i in combo
+            p_sum += p[i]
+            r_sum += r[i]
+        end
+        # push!(result, combo)
+        if p_sum <= P && r_sum <= R
+            push!(result, combo) 
+        end
+    end
+    result
+end
+
+# get the times it takes to run getFeasibleAssignments()
+function time_enumeration()
+    df = DataFrame(Dataset = Int64[], Instance = Int64[], Enumeration_Time = Float64[])
+    for d in 1:3
+        for i in 0:9
+            t = @elapsed get_feasible_assignments(d, i)
+            push!(df, [d, i, t])
+        end
+    end
+    return df
+end
+
+function strong_formulation(dataset, instance; verbose = true) 
+    # feasibleAssigns = [ [1], [2], [3], [1, 2], [1, 4, 5] ]
+    feasibleAssigns = get_feasible_assignments(dataset, instance)
+    t = @elapsed get_feasible_assignments(dataset, instance)
+    n = length(feasibleAssigns) #number of feasible assignments
+    m = maximum(maximum(feasibleAssigns)) # number of jobs
+
+    model = Model(Gurobi.Optimizer)
+    set_silent(model)
+    # Variable: 1 if assortment S is used, 0 otherwise
+    @variable(model, x[1:n], Bin) 
+    # Objective: minimize the number of assignments to machines (ie #machines used)
+    @objective(model, Min, sum(x))
+    # Constraint: all jobs completed
+    @constraint(model, jobs[j in 1:m], sum( x[S] for S in 1:n if j in feasibleAssigns[S] ) >= 1)
+    
+    # Find objective value of the continuous relaxation
+    undo_relax = relax_integrality(model)
+    optimize!(model)
+    LP_obj = objective_value(model)
+    LP_soln = [ value(x[i]) for i in 1:n ] #get the value of x*
+
+    # reimpose integrality reqs and solve
+    undo_relax()
+    optimize!(model)
+    IP_obj = objective_value(model)
+    IP_soln = [ value(x[i]) for i in 1:n ]
+
+    # if verbose
+    #     println("Objective is: ", IP_obj)
+    #     println("Job Assignments:")
+    #     for i in 1:n
+    #         if value(x[i]) == 1
+    #             println( feasibleAssigns[i] )
+    #         end
+            
+    #     end
+    # end
+
+    time = t + solve_time(model) # time to solve
+    nodes = node_count(model) # number of branch and bound nodes explored
+
+
+    return (LP_obj, IP_obj, nodes, time, LP_soln, IP_soln, feasibleAssigns)
+end
+
+# part 3
+function collect_data(formulation_id, time_limit = 120)
+    # Collect and report data on
+    # • average quality of the LP relaxations,
+    # • average number of branch-and-bound nodes, and
+    # • average computing times and number of problems solved in either 120 CPU seconds or 300 CPU seconds.
+    
+    df = DataFrame( Dataset = Int64[], Instance = Int64[], LP_Objective = Float64[], IP_Objective = Float64[], Node_Count = Int64[], Time = Float64[])
+    name_str = ""
+    for d in 1:3
+        for i in 0:9
+            (LP, IP, n, t) = (0, 0, 0, 0)
+            if formulation_id == 1
+                (LP, IP, n, t) = natural_formulation(d, i, time_limit)
+                name_str = "natural_alt"
+            elseif formulation_id ==2
+                (LP, IP, n, t) = strong_formulation(d, i)
+                name_str = "strong"
+            else
+                print("Invalid Input")
+                return
+            end
+            push!(df, [d, i, LP, IP, n, t])
+        end
+    end
+    df.Solution_Gap = (df.IP_Objective .- df.LP_Objective)./df.IP_Objective
+    CSV.write("/Users/Abe/Documents/!Cornell Tech/ORIE5135 Int Program/Project/data/q3/$(name_str)_solutions.csv", df)
+
+    return df
+end
+
+function analyze_data(df)
+    new_df = DataFrame( Dataset = Int64[], Solution_Gap = Float64[], Node_Count = Float64[], Time = Float64[], T_sub_120 = Int64[], T_sub_300 = Int64[])
+    if length(df.Dataset) > 10
+        for i in 0:2
+            lb = 10*i + 1
+            ub = 10*i + 10
+            d = i + 1
+            sg = mean(df.Solution_Gap[lb:ub])
+            nc = mean(df.Node_Count[lb:ub])
+            time = mean(df.Time[lb:ub])
+            sub_120 = 0
+            sub_300 = 0
+            for t in df.Time[lb:ub]
+                if t <= 120
+                    sub_120 += 1
+                end
+                if t <= 300
+                    sub_300 += 1
+                end
+            end
+            push!(new_df, [d, sg, nc, time, sub_120, sub_300])
+        end
+    else
+        d = 1
+        sg = mean(df.Solution_Gap)
+        nc = mean(df.Node_Count)
+        time = mean(df.Time)
+        sub_120 = 0
+        sub_300 = 0
+        for t in df.Time
+            if t <= 120
+                sub_120 += 1
+            end
+            if t <= 300
+                sub_300 += 1
+            end
+        end
+        push!(new_df, [d, sg, nc, time, sub_120, sub_300])
+    end
+    return new_df
+end
+
+function compare_models(time_limit) # runtime ~ time_limit * 30
+    df1 = DataFrame( Dataset = Int64[], Instance = Int64[], LP_Objective = Float64[], IP_Objective = Float64[], Node_Count = Int64[], Time = Float64[])
+    df2 = DataFrame( Dataset = Int64[], Instance = Int64[], LP_Objective = Float64[], IP_Objective = Float64[], Node_Count = Int64[], Time = Float64[])
+    for d in 1:3
+        for i in 0:9
+            (LP1, IP1, n1, t1) = natural_formulation(d, i, time_limit)
+            (LP2, IP2, n2, t2) = strong_formulation(d, i)
+            push!(df1, [d, i, LP1, IP1, n1, t1])
+            push!(df2, [d, i, LP2, IP2, n2, t2])
+        end
+    end
+    df1.Solution_Gap = (df2.IP_Objective .- df1.LP_Objective)./df2.IP_Objective
+    # df1.Optimal = df1.IP_Objective - df2.IP_Objective #0 if solved to optimality
+    df2.Solution_Gap = (df2.IP_Objective .- df2.LP_Objective)./df2.IP_Objective
+
+    CSV.write("/Users/Abe/Documents/!Cornell Tech/ORIE5135 Int Program/Project/data/q3/nat_solutions.csv", df1)
+    CSV.write("/Users/Abe/Documents/!Cornell Tech/ORIE5135 Int Program/Project/data/q3/strong_solutions.csv", df2)
+
+    return df1, df2
+end
+
+# (df1, df2) = compare_models(300)
+table1 = analyze_data(df1)
+table2 = analyze_data(df2)
+CSV.write("/Users/Abe/Documents/!Cornell Tech/ORIE5135 Int Program/Project/data/q3/nat_data.csv", table1)
+CSV.write("/Users/Abe/Documents/!Cornell Tech/ORIE5135 Int Program/Project/data/q3/strong_data.csv", table2)
+
+
+# df2 = collect_data(1)
+# df3 = analyze_data(df2)
+# CSV.write("/Users/Abe/Documents/!Cornell Tech/ORIE5135 Int Program/Project/data/q3/nat_alt_data.csv", df3)
+# DATA_DIR = "/Users/Abe/Documents/!Cornell Tech/ORIE5135 Int Program/Project/data/q3/strong_solutions.csv"
+# soln_df = CSV.read(DATA_DIR, DataFrames.DataFrame)
+# data_df = analyze_data(soln_df)
+# CSV.write("/Users/Abe/Documents/!Cornell Tech/ORIE5135 Int Program/Project/data/q3/strong_data.csv", data_df)
+
+# natural_formulation(1, 0, 50)

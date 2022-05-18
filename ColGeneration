@@ -1,0 +1,278 @@
+using JuMP
+using Pkg
+using TimerOutputs
+using Statistics
+using DataFramesMeta
+import DataFrames
+import CSV
+import Gurobi
+import Test
+import Random
+
+function get_input_data( question, dataset, instance )
+    # reads in the data from csv files and returns a tuple of the extracted quanitites.
+    ds_str = ""
+    if dataset == 4
+        ds_str = "bonus"
+        instance = 0
+    else
+        ds_str = "dataset_$(dataset)"
+    end
+
+    DATA_DIR = "/Users/Abe/Documents/!Cornell Tech/ORIE5135 Int Program/Project/data/q$(question)/$(ds_str)/instance_$(instance).csv"
+    CONSTANTS_DIR = "/Users/Abe/Documents/!Cornell Tech/ORIE5135 Int Program/Project/data/q$(question)/$(ds_str)/constants.csv"
+    job_attributes = CSV.read(DATA_DIR, DataFrames.DataFrame) #contains p_i and r_i
+    constants = CSV.read(CONSTANTS_DIR, DataFrames.DataFrame) #contains P, R, and n
+    p_i = job_attributes.p_i #time 
+    r_i = job_attributes.r_i #memory
+    if question == 5
+        (R, n) = constants.value
+        return (p_i, r_i, R, n)
+    else
+        (P, R, n) = constants.value
+        return (p_i, r_i, P, R, n)
+    end
+end
+
+function expand_to_maximal(subset, instance_data)
+    (p, r, P, R, n) = instance_data
+    available = [i for i in 1:n]
+    maximal = false
+    mem = 0
+    time = 0
+    while !maximal
+        mem = sum( r[i] for i in subset)
+        time = sum( p[i] for i in subset)
+        not_subset = [i for i in available if i ∉ subset]
+        Random.shuffle!(not_subset)
+        maximal = true
+        for i in not_subset
+            if (mem + r[i] <= R) && (time + p[i] <= P)
+                maximal = false
+                push!(subset, i)
+                break
+            end
+        end
+    end
+    return subset
+end
+
+function initialize(data) # start with m maximal sets
+    m = data[5]
+    indices = [i for i in 1:m]
+    sets = Vector[]
+
+    for i in indices
+        set = expand_to_maximal( [i], data )
+        push!(sets, set)
+        indices = [i for i in indices if i ∉ set]
+    end
+    return sets
+end
+
+function solve_reduced(subset, time_limit_sec = 300, LP_relax = true) #returns primal_soln, dual_soln
+    n = length(subset) #number of feasible assignments
+    m = 0
+    for sub in subset
+        if maximum(sub) > m
+            m = maximum(sub)
+        end
+    end
+    # use the strong formulation
+    model = Model(Gurobi.Optimizer)
+    @variable(model, x[1:n], Bin) 
+    @objective(model, Min, sum(x))
+    @constraint(model, jobs[j in 1:m], sum( x[S] for S in 1:n if j in subset[S] ) >= 1)
+    
+    # Find objective value of the continuous relaxation
+    if LP_relax
+        set_silent(model)
+        relax_integrality(model)
+    else
+        set_time_limit_sec(model, time_limit_sec)
+    end
+    optimize!(model)
+    obj = objective_value(model)
+    primal_soln = [ value(x[i]) for i in 1:n ] #get the value of x*
+    if LP_relax
+        dual_soln = [ dual(jobs[j]) for j in 1:m ] #get the dual solution y*
+        return (primal_soln, dual_soln, obj)
+    end
+    return obj, primal_soln
+    
+end
+
+function find_violated_subset(dual_solution, instance_data)
+    y = dual_solution
+    (p, r, P, R) = instance_data
+    m = length(y)
+
+    model = Model(Gurobi.Optimizer)
+    set_silent(model)
+    @variable(model, z[1:m], Bin) # z(i) = 1 if object i belongs to the subset
+    
+    @objective(model, Max, sum( y[i] * z[i] for i in 1:m) )
+
+    # Constraint: Memory limit
+    @constraint(model, memory, sum( r[i] * z[i] for i in 1:m) <= R )
+
+    # Constraint: Time Requirement
+    @constraint(model, processing_time, sum( p[i] * z[i] for i in 1:m) <= P )
+    
+    optimize!(model)
+    obj = objective_value(model)
+    subset = [ i for i in 1:m if value(z[i]) == 1 ]
+    return obj, subset
+end
+
+function combinatorial_knapsack(dual_solution, instance_data)
+    # heuristic alternative to find_violated_subset
+    # solves the knapskack problem using a combinatorial algorithm
+    # significantly faster (~30%), but 
+    # the knapsack is not the biggest time 
+    y = dual_solution
+    (p, r, P, R) = instance_data
+    m = length(y)
+
+    # density_p = [ y[i]/p[i] for i in 1:m ] 
+    # density_r = [ y[i]/r[i] for i in 1:m ]
+    density_min = [ y[i]/maximum( (r[i], p[i]) ) for i in 1:m ]
+
+    # indices_p = sortperm(density_p)
+    # indices_r = sortperm(density_r)
+    indices_min = reverse( sortperm(density_min) )
+
+    P_ = P
+    R_ = R
+
+    x = [ 0 for i in 1:m ]
+
+    for i in indices_min
+        condition1 = p[i] <= P_ 
+        condition2 = r[i] <= R_
+        condition = condition1 & condition2
+        if condition
+            x[i] = 1
+            P_ = P_ - p[i]
+            R_ = R_ - r[i]
+        else
+            # x[i] = P_/p[i]
+            break
+            # return sum(x), x
+        end
+    end
+    subset = [i for i in 1:m if x[i] == 1]
+    obj = 0
+    for i in 1:m 
+        obj += y[i]*x[i]
+    end
+    return obj, subset
+end
+
+function column_generation(dataset, instance, iter_limit) #4, 0 is the big one
+    tolerance = 1e-10
+
+    data = get_input_data(3, dataset, instance) 
+    S_tilde = initialize(data)
+    (obj, x_star, i) = (0, 0, 0)
+    while i < iter_limit #hard cap on iterations (use 3000 for big set)
+        i+= 1
+        #step 2
+        (x_star, y_star, obj) = solve_reduced(S_tilde) #get primal and dual solutions
+        # println(length(y_star))
+
+        #find the most violated subset
+        (z_bar, S) = find_violated_subset(y_star, data)
+        #if it is dual feasible, return the solution!
+        if z_bar <= 1 + tolerance
+            println("Optimal Solution Found")
+            return (obj, x_star, S_tilde, i) # DONE!
+        end
+        # otherwise, expand it to a maximum subset, and add it to S_tilde
+        new_S = expand_to_maximal(S, data)
+        push!(S_tilde, new_S)
+        println((z_bar, obj, i))
+    end
+    println("Iteration Cap Reached")
+    return (obj, x_star, S_tilde, i)
+end
+
+function get_assignments(x_int, S_tilde)
+    sets = []
+    for i in 1:length(S_tilde)
+        if x_int[i] == 1
+            add = S_tilde[i]
+            # println(add)
+            push!(sets, add)
+        end
+    end
+    return sets
+end
+
+function collect_data()
+    df = DataFrame( Dataset = Int64[], Instance = Int64[], LP_Objective = Float64[], IP_Objective = Float64[], Iteration_Count = Int64[])
+    
+    for d in 1:3
+        for i in 0:9
+            
+            (LP, x_star, S_tilde, iters) = column_generation(d, i, 500)
+            (IP, x_int) = solve_reduced(S_tilde, false)
+            
+            push!(df, [d, i, LP, IP, iters])
+        end
+    end
+    # df.Solution_Gap = (df.IP_Objective .- df.LP_Objective)./df.IP_Objective
+
+    DATA_DIR = "/Users/Abe/Documents/!Cornell Tech/ORIE5135 Int Program/Project/data/q3/solutions.csv"
+    df2 = CSV.read(DATA_DIR, DataFrames.DataFrame) #contains p_i and r_i
+
+    df.Correct_IP = df2.IP_Objective
+    df.Delta = df.IP_Objective .- df.Correct_IP
+    # println(df)
+    CSV.write("/Users/Abe/Documents/!Cornell Tech/ORIE5135 Int Program/Project/data/q3/bonus/col_gen_solns.csv", df)
+    return df
+end
+
+function solve_big(cg_iter_limit, int_time_limit)
+    (lin_obj, x_star, S_tilde, i) = column_generation(4, 0, cg_iter_limit)
+    (int_obj, x_int) = solve_reduced(S_tilde, int_time_limit, false )
+    opt_sets = get_assignments(x_int, S_tilde)
+
+    return (lin_obj, int_obj, opt_sets)
+end
+
+function assigns_to_df(opt_sets)
+    sol_df = DataFrame(n = Int64[], col1 = Int64[], col2 = Int64[], col3 = Int64[], col4 = Int64[])
+    for i in 1:length(opt_sets)
+        s = opt_sets[i]
+        while length(s) < 4
+            push!(s, 0) #add dummy vals to meet row length req
+        end
+        
+        insert!(s, 1, i)
+        # println(s)
+        push!(sol_df, s)
+    end
+    # println(sol_df)
+    num = size(sol_df, 1)
+    CSV.write("/Users/Abe/Documents/!Cornell Tech/ORIE5135 Int Program/Project/data/q3/bonus/$(num)_assignments.csv", sol_df)
+    return sol_df
+end
+
+(lin_obj, int_obj, opt_sets) = solve_big(500, 60) 
+# solves the bonus instance with given iter and time limits
+# 2800 iters ->  ~90 mins
+# 2000 iters ->  ~16 mins
+# 1000 iters ->  ~3 mins
+# 500  iters -> ~1 min
+assigns_to_df(opt_sets) #saves the solution in a csv & returns a df
+
+# collect_data() # results of column generation on smaller instances
+
+
+
+
+
+
+
+
